@@ -1,0 +1,145 @@
+#!/bin/sh
+
+#PBS -N minionerec_eval
+#PBS -P personal-e1553316
+#PBS -q normal
+#PBS -l select=1:ngpus=4
+#PBS -l walltime=4:00:00
+#PBS -j oe
+
+cd $PBS_O_WORKDIR
+
+# 加载模块
+module purge
+module load craype-accel-nvidia80
+module load miniforge3
+
+# 激活 conda 环境
+conda activate minionerec
+
+# 打印调试信息
+echo "=========================================="
+echo "Job started: $(date)"
+echo "Working directory: $(pwd)"
+echo "=========================================="
+nvidia-smi
+echo "=========================================="
+python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+echo "=========================================="
+
+# 环境变量
+export NCCL_IB_DISABLE=1
+export OMP_NUM_THREADS=8
+export HF_ENDPOINT=https://hf-mirror.com
+
+# ===================== 配置区域 =====================
+category="Industrial_and_Scientific"
+
+# RL v3 final model（effective batch=1024，验证集峰值 HR@5=12.68%@epoch1.6）
+exp_name="./output_dir/rl_Industrial_and_Scientific_20260208_124230"
+
+test_file=$(ls ./data/Amazon/test/${category}*.csv 2>/dev/null | head -1)
+info_file=$(ls ./data/Amazon/info/${category}*.txt 2>/dev/null | head -1)
+
+# 多卡评估参数（对齐 evaluate.sh）
+NUM_BEAMS=50
+BATCH_SIZE=8
+MAX_NEW_TOKENS=256
+TEMPERATURE=1.0
+GUIDANCE_SCALE=1.0
+CUDA_LIST="0,1,2,3"
+# ===================== 配置结束 =====================
+
+# 检查文件
+echo "File check:"
+echo "  model: ${exp_name}"
+[ -d "${exp_name}" ] && echo "    OK" || echo "    NOT FOUND"
+echo "  test:  ${test_file}"
+[ -f "${test_file}" ] && echo "    OK" || echo "    NOT FOUND"
+echo "  info:  ${info_file}"
+[ -f "${info_file}" ] && echo "    OK" || echo "    NOT FOUND"
+echo "=========================================="
+
+if [ ! -d "${exp_name}" ]; then
+    echo "ERROR: Model directory not found: ${exp_name}"
+    exit 1
+fi
+if [ ! -f "${test_file}" ]; then
+    echo "ERROR: Test file not found: ${test_file}"
+    exit 1
+fi
+if [ ! -f "${info_file}" ]; then
+    echo "ERROR: Info file not found: ${info_file}"
+    exit 1
+fi
+
+# 创建临时目录和结果目录
+exp_name_clean=$(basename "${exp_name}")
+temp_dir="./temp/${category}-${exp_name_clean}"
+output_dir="./results/${exp_name_clean}"
+mkdir -p "${temp_dir}"
+mkdir -p "${output_dir}"
+
+# Step 1: 切分测试数据（4 卡并行）
+echo "[Step 1/4] Splitting test data for 4 GPUs..."
+python ./split.py \
+    --input_path "${test_file}" \
+    --output_path "${temp_dir}" \
+    --cuda_list "${CUDA_LIST}"
+
+if [ ! -f "${temp_dir}/0.csv" ]; then
+    echo "ERROR: Data splitting failed"
+    exit 1
+fi
+echo "  Split complete"
+
+# Step 2: 多卡并行评估（对齐 evaluate.sh）
+echo "[Step 2/4] Running parallel evaluation on 4 GPUs..."
+echo "  num_beams=${NUM_BEAMS}, batch_size=${BATCH_SIZE}"
+
+for i in 0 1 2 3
+do
+    if [ -f "${temp_dir}/${i}.csv" ]; then
+        echo "  Starting evaluation on GPU $i"
+        CUDA_VISIBLE_DEVICES=$i python -u ./evaluate.py \
+            --base_model "${exp_name}" \
+            --info_file "${info_file}" \
+            --category "${category}" \
+            --test_data_path "${temp_dir}/${i}.csv" \
+            --result_json_data "${temp_dir}/${i}.json" \
+            --batch_size ${BATCH_SIZE} \
+            --num_beams ${NUM_BEAMS} \
+            --max_new_tokens ${MAX_NEW_TOKENS} \
+            --temperature ${TEMPERATURE} \
+            --guidance_scale ${GUIDANCE_SCALE} \
+            --length_penalty 0.0 &
+    fi
+done
+echo "Waiting for all evaluation processes to complete..."
+wait
+echo "  Evaluation complete"
+
+# Step 3: 合并结果
+echo "[Step 3/4] Merging results..."
+actual_cuda_list=$(ls "${temp_dir}"/*.json 2>/dev/null | sed 's/.*\///g' | sed 's/\.json//g' | tr '\n' ',' | sed 's/,$//')
+echo "  Merging results from GPUs: ${actual_cuda_list}"
+python ./merge.py \
+    --input_path "${temp_dir}" \
+    --output_path "${output_dir}/final_result_${category}.json" \
+    --cuda_list "${actual_cuda_list}"
+
+if [ ! -f "${output_dir}/final_result_${category}.json" ]; then
+    echo "ERROR: Result merging failed"
+    exit 1
+fi
+
+# Step 4: 计算指标
+echo "[Step 4/4] Calculating metrics (HR@K, NDCG@K)..."
+python ./calc.py \
+    --path "${output_dir}/final_result_${category}.json" \
+    --item_path "${info_file}"
+
+echo "=========================================="
+echo "Job finished: $(date)"
+echo "Results saved to: ${output_dir}/final_result_${category}.json"
+echo "=========================================="

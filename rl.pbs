@@ -1,0 +1,191 @@
+#!/bin/sh
+
+#PBS -N minionerec_rl
+#PBS -P personal-e1553316
+#PBS -q normal
+#PBS -l select=1:ngpus=4
+#PBS -l walltime=24:00:00
+#PBS -j oe
+
+cd $PBS_O_WORKDIR
+
+# 清理并加载必要模块
+module purge
+module load craype-accel-nvidia80
+module load miniforge3
+
+# 激活 conda 环境
+conda activate minionerec
+
+# 打印调试信息
+echo "=========================================="
+echo "Job started: $(date)"
+echo "Working directory: $(pwd)"
+echo "=========================================="
+echo "Loaded modules:"
+module list
+echo "=========================================="
+echo "GPU information:"
+nvidia-smi
+echo "=========================================="
+echo "Python environment:"
+which python
+python --version
+echo "=========================================="
+echo "PyTorch version:"
+python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU count: {torch.cuda.device_count()}'); print(f'CUDA version: {torch.version.cuda if torch.cuda.is_available() else \"N/A\"}')"
+echo "=========================================="
+
+# 设置环境变量
+export NCCL_IB_DISABLE=1
+export OMP_NUM_THREADS=8
+export HF_ENDPOINT=https://hf-mirror.com
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export WANDB_MODE=offline
+
+# GPU 配置
+NUM_GPUS=4
+
+# ==========================================
+# RL 训练配置（4 卡 A100 优化）
+# ==========================================
+
+category="Industrial_and_Scientific"
+
+# 数据文件
+train_file="./data/Amazon/train/${category}_5_2016-10-2018-11.csv"
+eval_file="./data/Amazon/valid/${category}_5_2016-10-2018-11.csv"
+info_file="./data/Amazon/info/${category}_5_2016-10-2018-11.txt"
+sid_index_path="./data/Amazon/index/${category}.index.json"
+item_meta_path="./data/Amazon/index/${category}.item.json"
+
+# SFT 模型路径（RL 的起点，从 SFT 重新开始）
+MODEL_PATH="./output_dir/sft_Industrial_and_Scientific_20260206_190621"
+
+# RL 输出目录（带时间戳）
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+OUTPUT_DIR="./output_dir/rl_${category}_${TIMESTAMP}"
+
+# ------------------------------------------
+# RL 超参数（4 卡 A100 40GB + DeepSpeed ZeRO-2）
+# ------------------------------------------
+# GRPO: per_device_train_batch_size 必须是 num_generations 的倍数
+# 每张卡: batch_size=64, num_generations=16 → 4 unique prompts/卡/step
+# 4 卡 × 4 prompts × grad_accum=4 = 64 unique prompts/step
+# effective batch = 64 × 4 × 4 = 1024 samples/step（完全对齐原项目）
+# ------------------------------------------
+
+TRAIN_BATCH_SIZE=64             # per_device_train_batch_size（对齐原项目，OOM则改回32）
+EVAL_BATCH_SIZE=128             # per_device_eval_batch_size（对齐原项目，评估无梯度显存充足）
+GRAD_ACCUM=4                    # 梯度累积（effective batch=1024，完全对齐原项目）
+NUM_GENERATIONS=16              # 每个 prompt 的候选生成数
+LEARNING_RATE=1e-5              # 对齐原项目 rl.sh
+BETA=1e-3                       # KL 惩罚系数（对齐原项目，原值0.04过大）
+TEMPERATURE=1.0                 # 采样温度
+NUM_EPOCHS=2                    # 对齐原项目 rl.sh
+REWARD_TYPE="ranking"           # rule + ndcg 排名感知奖励
+TEST_BEAM=16                    # 评估时的 beam 数
+
+echo "Data files check:"
+echo "  train: ${train_file}"
+[ -f "${train_file}" ] && echo "    ✓ EXISTS" || echo "    ✗ NOT FOUND"
+echo "  eval: ${eval_file}"
+[ -f "${eval_file}" ] && echo "    ✓ EXISTS" || echo "    ✗ NOT FOUND"
+echo "  info: ${info_file}"
+[ -f "${info_file}" ] && echo "    ✓ EXISTS" || echo "    ✗ NOT FOUND"
+echo "  sid_index: ${sid_index_path}"
+[ -f "${sid_index_path}" ] && echo "    ✓ EXISTS" || echo "    ✗ NOT FOUND"
+echo "  item_meta: ${item_meta_path}"
+[ -f "${item_meta_path}" ] && echo "    ✓ EXISTS" || echo "    ✗ NOT FOUND"
+echo "=========================================="
+
+# 检查必需文件
+for f in "${train_file}" "${eval_file}" "${info_file}" "${sid_index_path}" "${item_meta_path}"; do
+    if [ ! -f "${f}" ]; then
+        echo "ERROR: File not found: ${f}"
+        exit 1
+    fi
+done
+
+# 检查 SFT 模型是否存在
+if [ ! -d "${MODEL_PATH}" ]; then
+    echo "ERROR: SFT model not found: ${MODEL_PATH}"
+    exit 1
+fi
+echo "SFT model check: ${MODEL_PATH}"
+ls -lh "${MODEL_PATH}/config.json" 2>/dev/null && echo "    ✓ Model config found" || echo "    ✗ Model config NOT FOUND"
+echo "=========================================="
+
+echo "RL Training configuration:"
+echo "  SFT model (input): ${MODEL_PATH}"
+echo "  Output dir: ${OUTPUT_DIR}"
+echo "  Num GPUs: ${NUM_GPUS}"
+echo "  Train batch size (per GPU): ${TRAIN_BATCH_SIZE}"
+echo "  Eval batch size (per GPU): ${EVAL_BATCH_SIZE}"
+echo "  Gradient accumulation: ${GRAD_ACCUM}"
+echo "  Effective batch size: $((TRAIN_BATCH_SIZE * GRAD_ACCUM * NUM_GPUS))"
+echo "  Num generations: ${NUM_GENERATIONS}"
+echo "  Learning rate: ${LEARNING_RATE}"
+echo "  Beta (KL penalty): ${BETA}"
+echo "  Temperature: ${TEMPERATURE}"
+echo "  Num epochs: ${NUM_EPOCHS}"
+echo "  Reward type: ${REWARD_TYPE}"
+echo "  Test beam: ${TEST_BEAM}"
+echo "=========================================="
+
+# 创建输出目录
+mkdir -p "${OUTPUT_DIR}"
+
+# 4 卡分布式 RL 训练（DeepSpeed ZeRO-2）
+accelerate launch \
+    --config_file ./config/zero2_opt.yaml \
+    --num_processes ${NUM_GPUS} \
+    --main_process_port 29503 \
+    rl.py \
+    --model_path "${MODEL_PATH}" \
+    --train_file "${train_file}" \
+    --eval_file "${eval_file}" \
+    --info_file "${info_file}" \
+    --sid_index_path "${sid_index_path}" \
+    --item_meta_path "${item_meta_path}" \
+    --category "${category}" \
+    --output_dir "${OUTPUT_DIR}" \
+    --train_batch_size ${TRAIN_BATCH_SIZE} \
+    --eval_batch_size ${EVAL_BATCH_SIZE} \
+    --gradient_accumulation_steps ${GRAD_ACCUM} \
+    --num_generations ${NUM_GENERATIONS} \
+    --learning_rate ${LEARNING_RATE} \
+    --beta ${BETA} \
+    --temperature ${TEMPERATURE} \
+    --num_train_epochs ${NUM_EPOCHS} \
+    --reward_type "${REWARD_TYPE}" \
+    --beam_search True \
+    --test_during_training True \
+    --test_beam ${TEST_BEAM} \
+    --wandb_project "minionerec" \
+    --wandb_run_name "${category}_rl_${REWARD_TYPE}_4gpu" \
+    --sync_ref_model True \
+    --seed 42
+
+EXIT_CODE=$?
+
+echo "=========================================="
+echo "Job finished: $(date)"
+echo "Exit code: ${EXIT_CODE}"
+echo "Output directory: ${OUTPUT_DIR}"
+echo "=========================================="
+
+if [ ${EXIT_CODE} -eq 0 ]; then
+    echo "RL Training completed successfully!"
+    echo "Output contents:"
+    ls -lh "${OUTPUT_DIR}"
+    echo ""
+    echo "Next step: Run evaluation with eval.pbs on the RL model"
+    echo "  Model path: ${OUTPUT_DIR}"
+else
+    echo "RL Training failed with exit code ${EXIT_CODE}"
+    echo "Check the log for errors."
+fi
+
+exit ${EXIT_CODE}

@@ -1,0 +1,33 @@
+# 大模型文件
+models/*
+*.pth
+*.bin
+*.safetensors
+
+# 输出和 checkpoint
+output_dir/
+wandb/
+results/
+*.ckpt
+*.jsonl  # 如果有大 json
+
+# 临时文件
+__pycache__/
+*.pyc
+*.log
+temp/
+
+# PBS 作业日志
+*.o[0-9]*
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# 个人笔记和调试脚本
+md/
+config_sft.sh
+debug_sft.pbs

@@ -1,0 +1,151 @@
+#!/bin/sh
+
+#PBS -N minionerec_sft
+#PBS -P personal-e1553316
+#PBS -q normal
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+
+cd $PBS_O_WORKDIR
+
+# 清理并加载必要模块
+module purge
+module load craype-accel-nvidia80
+module load miniforge3
+
+# 激活 conda 环境
+conda activate minionerec
+
+# 打印调试信息
+echo "=========================================="
+echo "Job started: $(date)"
+echo "Working directory: $(pwd)"
+echo "=========================================="
+echo "Loaded modules:"
+module list
+echo "=========================================="
+echo "GPU information:"
+nvidia-smi
+echo "=========================================="
+echo "Python environment:"
+which python
+python --version
+echo "=========================================="
+echo "PyTorch version:"
+python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda if torch.cuda.is_available() else \"N/A\"}')"
+echo "=========================================="
+
+# 设置环境变量（与原始 sft.sh 保持一致，增加 HPC 必需配置）
+export NCCL_IB_DISABLE=1                        # 原始脚本配置
+export OMP_NUM_THREADS=8
+export HF_ENDPOINT=https://hf-mirror.com         # HF 镜像加速（国内网络优化）
+export HF_HUB_OFFLINE=1                          # 禁用 HF Hub 在线检查（避免代理错误）
+export TRANSFORMERS_OFFLINE=1                    # 完全离线模式
+export WANDB_MODE=offline                        # 离线模式，避免网络阻塞
+
+# 数据文件配置
+category="Industrial_and_Scientific"
+train_file="./data/Amazon/train/${category}_5_2016-10-2018-11.csv"
+eval_file="./data/Amazon/valid/${category}_5_2016-10-2018-11.csv"
+test_file="./data/Amazon/test/${category}_5_2016-10-2018-11.csv"
+sid_index_path="./data/Amazon/index/${category}.index.json"
+item_meta_path="./data/Amazon/index/${category}.item.json"
+
+echo "Data files check:"
+echo "  train: ${train_file}"
+[ -f "${train_file}" ] && echo "    ✓ EXISTS" || echo "    ✗ NOT FOUND"
+echo "  eval: ${eval_file}"
+[ -f "${eval_file}" ] && echo "    ✓ EXISTS" || echo "    ✗ NOT FOUND"
+echo "  test: ${test_file}"
+[ -f "${test_file}" ] && echo "    ✓ EXISTS" || echo "    ✗ NOT FOUND"
+echo "  sid_index: ${sid_index_path}"
+[ -f "${sid_index_path}" ] && echo "    ✓ EXISTS" || echo "    ✗ NOT FOUND"
+echo "  item_meta: ${item_meta_path}"
+[ -f "${item_meta_path}" ] && echo "    ✓ EXISTS" || echo "    ✗ NOT FOUND"
+echo "=========================================="
+
+# 检查必需文件
+if [ ! -f "${train_file}" ]; then
+    echo "ERROR: Training file not found: ${train_file}"
+    exit 1
+fi
+
+if [ ! -f "${eval_file}" ]; then
+    echo "ERROR: Eval file not found: ${eval_file}"
+    exit 1
+fi
+
+# 模型路径
+BASE_MODEL="./models/Qwen2.5-1.5B"  # Qwen2.5-1.5B 基础模型
+# 使用已有的输出目录，从 checkpoint 恢复
+OUTPUT_DIR="./output_dir/sft_Industrial_and_Scientific_20260206_190621"
+
+# 单卡训练配置（基于原始 sft.sh 的 8 卡配置）
+# 原始: 8 卡 × batch_size=1024, micro_batch_size=16
+# 单卡: 保持 effective batch size 相同，即总 batch=1024
+BATCH_SIZE=1024            # 保持与原始脚本一致
+MICRO_BATCH_SIZE=16        # 保持与原始脚本一致
+LEARNING_RATE=3e-4         # sft.py 默认值
+NUM_EPOCHS=10              # sft.py 默认值
+
+echo "Training configuration:"
+echo "  Base model: ${BASE_MODEL}"
+echo "  Output dir: ${OUTPUT_DIR}"
+echo "  Batch size: ${BATCH_SIZE}"
+echo "  Micro batch size: ${MICRO_BATCH_SIZE}"
+echo "  Gradient accumulation steps: $((BATCH_SIZE / MICRO_BATCH_SIZE))"
+echo "  Learning rate: ${LEARNING_RATE}"
+echo "  Num epochs: ${NUM_EPOCHS}"
+echo "  Note: Original sft.sh uses 8 GPUs, we adapt to 1 GPU with same effective batch size"
+echo "=========================================="
+
+# 创建输出目录
+mkdir -p "${OUTPUT_DIR}"
+
+# 检查是否有未完成的 checkpoint（支持断点续训）
+LATEST_CHECKPOINT=""
+if [ -d "output_dir" ]; then
+    LATEST_CHECKPOINT=$(find output_dir -type d -name "checkpoint-*" -printf "%T@ %p\n" 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2)
+    if [ -n "${LATEST_CHECKPOINT}" ] && [ -f "${LATEST_CHECKPOINT}/trainer_state.json" ]; then
+        echo "Found checkpoint: ${LATEST_CHECKPOINT}"
+        echo "Resume from checkpoint? (will use --resume_from_checkpoint)"
+    fi
+fi
+
+# 单卡运行（使用 python 而不是 torchrun 来避免 DDP 开销）
+# 如果需要使用 torchrun，保留 --nproc_per_node 1
+# 单卡运行：使用 python 而不是 torchrun（原始用 torchrun --nproc_per_node 8）
+python sft.py \
+    --base_model "${BASE_MODEL}" \
+    --batch_size ${BATCH_SIZE} \
+    --micro_batch_size ${MICRO_BATCH_SIZE} \
+    --train_file "${train_file}" \
+    --eval_file "${eval_file}" \
+    --output_dir "${OUTPUT_DIR}" \
+    --wandb_project "minionerec" \
+    --wandb_run_name "${category}_sft" \
+    --category "${category}" \
+    --train_from_scratch False \
+    --seed 42 \
+    --sid_index_path "${sid_index_path}" \
+    --item_meta_path "${item_meta_path}" \
+    --freeze_LLM False \
+    ${LATEST_CHECKPOINT:+--resume_from_checkpoint "${LATEST_CHECKPOINT}"}
+
+EXIT_CODE=$?
+
+echo "=========================================="
+echo "Job finished: $(date)"
+echo "Exit code: ${EXIT_CODE}"
+echo "Output directory: ${OUTPUT_DIR}"
+echo "=========================================="
+
+if [ ${EXIT_CODE} -eq 0 ]; then
+    echo "Training completed successfully!"
+    ls -lh "${OUTPUT_DIR}"
+else
+    echo "Training failed with exit code ${EXIT_CODE}"
+fi
+
+exit ${EXIT_CODE}
